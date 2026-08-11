@@ -35,6 +35,12 @@ class EasyIQHomework(AulaDataClass):
         so ``id`` falls back to the start timestamp and ``is_completed`` stays
         ``False``. The subject doubles as the title, matching how the EasyIQ
         widget itself labels homework.
+
+        The homework controller's rows carry the subject as ``CoursesDisplay``
+        (e.g. "Dansk"), not the ``Courses``/``courses`` key
+        :attr:`EasyIQCalendarEvent.courses` reads, so ``subject`` is empty if
+        read from there; it falls back to ``courses`` for rows that do use
+        that key.
         """
         row = {str(k).lower(): v for k, v in (event._raw or {}).items()}
         return cls(
@@ -43,6 +49,6 @@ class EasyIQHomework(AulaDataClass):
             title=event.title,
             description=event.description,
             due_date=event.start,
-            subject=event.courses,
+            subject=row.get("coursesdisplay") or event.courses,
             is_completed=False,
         )

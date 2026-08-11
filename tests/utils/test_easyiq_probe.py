@@ -159,6 +159,10 @@ class TestProbeEasyIQ:
         client.widgets._get_bearer_token = AsyncMock(return_value="Bearer t")
         client.widgets.easyiq_headers = Mock(return_value={"Authorization": "Bearer t"})
         client.widgets.easyiq_identifier_variants = Mock(return_value=[("4242", "astr8360")])
+        client.widgets.ensure_easyiq_session = AsyncMock(return_value=None)
+        client.widgets.resolve_easyiq_child_id = Mock(return_value=None)
+        client.widgets._normalize_easyiq_name = Mock(side_effect=lambda n: str(n).casefold())
+        client.widgets._easyiq_children_ambiguous = set()
         client._request_with_version_retry = AsyncMock(side_effect=responses)
         return client
 

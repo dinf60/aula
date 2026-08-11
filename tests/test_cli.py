@@ -8,6 +8,7 @@ import pytest
 from aula.cli import (
     CONTACTS_PAGE_SIZE,
     MAX_CONTACT_PAGES,
+    _easyiq_child_user_ids,
     _fetch_contact_pages,
     _password_provider,
     _print_otp_code,
@@ -25,6 +26,48 @@ def _pager(total: int):
         return [{"id": i} for i in range(start, min(start + CONTACTS_PAGE_SIZE, total))]
 
     return fetch_page, calls
+
+
+class TestEasyiqChildUserIds:
+    def test_reads_the_active_institution_profiles_relations(self):
+        profile_context = {
+            "data": {
+                "institutionProfile": {
+                    "relations": [{"userId": "child-1"}, {"userId": "child-2"}]
+                }
+            }
+        }
+        assert _easyiq_child_user_ids(profile_context) == ["child-1", "child-2"]
+
+    def test_includes_children_at_other_institutions(self):
+        """A child not at the profile's primary institution still counts."""
+        profile_context = {
+            "data": {
+                "institutionProfile": {"relations": [{"userId": "child-1"}]},
+                "institutions": [
+                    {"children": [{"userId": "child-2"}]},
+                    {"children": [{"userId": "child-3"}]},
+                ],
+            }
+        }
+        assert _easyiq_child_user_ids(profile_context) == ["child-1", "child-2", "child-3"]
+
+    def test_deduplicates_a_child_listed_in_both_places(self):
+        profile_context = {
+            "data": {
+                "institutionProfile": {"relations": [{"userId": "child-1"}]},
+                "institutions": [{"children": [{"userId": "child-1"}]}],
+            }
+        }
+        assert _easyiq_child_user_ids(profile_context) == ["child-1"]
+
+    def test_missing_or_malformed_data_yields_an_empty_list(self):
+        assert _easyiq_child_user_ids({}) == []
+        assert _easyiq_child_user_ids({"data": {}}) == []
+        assert _easyiq_child_user_ids({"data": {"institutions": "not-a-list"}}) == []
+        assert _easyiq_child_user_ids(
+            {"data": {"institutionProfile": {"relations": [{"noUserId": True}, "nope"]}}}
+        ) == []
 
 
 class TestFetchContactPages:

@@ -86,3 +86,9 @@ def test_dict_conversion_drops_raw():
     result = dict(EasyIQCalendarEvent.from_dict({"itemType": 4, "courses": "Dansk"}))
     assert result["courses"] == "Dansk"
     assert "_raw" not in result
+
+
+def test_description_html_entities_are_decoded():
+    """The portal sends raw HTML entities, unlike every other Aula source."""
+    event = EasyIQCalendarEvent.from_dict({"description": "l&aelig;st p&aring; s. 6-8"})
+    assert event.description == "læst på s. 6-8"

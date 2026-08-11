@@ -17,7 +17,7 @@ def monday_of_week(week: str) -> str:
     try:
         year_part, week_part = week.split("-W")
         monday = datetime.date.fromisocalendar(int(year_part), int(week_part), 1)
-    except ValueError, AttributeError:
+    except (ValueError, AttributeError):
         _LOGGER.warning("Could not parse week %r, using today's date instead", week)
         monday = datetime.date.today()
     return f"{monday.isoformat()}T00:00:00Z"

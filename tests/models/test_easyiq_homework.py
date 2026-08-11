@@ -64,6 +64,25 @@ def test_easyiq_homework_from_calendar_event_without_an_id():
     assert EasyIQHomework.from_calendar_event(event).id == "2026-02-28T00:00:00"
 
 
+def test_easyiq_homework_subject_reads_courses_display():
+    """The homework controller carries the subject as CoursesDisplay, not Courses."""
+    raw = {
+        "itemType": 4,
+        "id": "evt-9",
+        "start": "2026-02-28T00:00:00",
+        "CoursesDisplay": "Dansk",
+        "ActivitiesDisplay": "6A",
+    }
+    hw = EasyIQHomework.from_calendar_event(EasyIQCalendarEvent.from_dict(raw))
+    assert hw.subject == "Dansk"
+
+
+def test_easyiq_homework_subject_falls_back_to_courses_without_a_display_field():
+    raw = {"itemType": 4, "start": "2026-02-28T00:00:00", "courses": "Matematik"}
+    hw = EasyIQHomework.from_calendar_event(EasyIQCalendarEvent.from_dict(raw))
+    assert hw.subject == "Matematik"
+
+
 def test_easyiq_homework_dict_conversion():
     hw = EasyIQHomework(
         id="hw-1",

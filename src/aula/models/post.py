@@ -54,7 +54,7 @@ class Post(AulaDataClass):
                 if dt_str.endswith("Z"):
                     dt_str = dt_str[:-1] + "+00:00"
                 return datetime.datetime.fromisoformat(dt_str)
-            except ValueError, TypeError:
+            except (ValueError, TypeError):
                 return None
 
         owner = ProfileReference.from_dict(data.get("ownerProfile", {}))

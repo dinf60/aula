@@ -292,5 +292,5 @@ def _parse_date_str(date_str: str) -> date | None:
         return None
     try:
         return datetime.fromisoformat(date_str).date()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):
         return None

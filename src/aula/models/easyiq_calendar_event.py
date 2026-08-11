@@ -1,3 +1,4 @@
+import html
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,7 +82,9 @@ class EasyIQCalendarEvent(AulaDataClass):
             end=_first_text(folded, _END_KEYS),
             courses=_first_text(folded, _COURSE_KEYS),
             activities=_first_text(folded, _ACTIVITY_KEYS),
-            description=_first_text(folded, _DESCRIPTION_KEYS),
+            # The portal answers with raw HTML entities (e.g. "l&aelig;st"),
+            # unlike every other Aula source, which already sends plain text.
+            description=html.unescape(_first_text(folded, _DESCRIPTION_KEYS)),
         )
 
     @property
