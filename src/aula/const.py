@@ -12,6 +12,7 @@ EASYIQ_PORTAL = "https://skoleportal.easyiqcloud.dk"
 EASYIQ_CALENDAR_PATH = "/Calendar/CalendarGetWeekplanEvents"
 EASYIQ_HOMEWORK_PATH = "/AulaHuskeliste/GetWeekplanEvents"
 EASYIQ_CHILDREN_PATH = "/Aula/GetChildren"
+EASYIQ_AUTHENTICATE_PATH = "/Aula/AuthenticateAulaUser"
 MEEBOOK_API = "https://app.meebook.com/aulaapi"
 CICERO_API = "https://surf.cicero-suite.com/portal-api/rest/aula"
 

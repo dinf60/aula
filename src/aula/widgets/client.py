@@ -4,7 +4,9 @@ from typing import Any, Protocol
 from ..const import (
     CICERO_API,
     EASYIQ_API,
+    EASYIQ_AUTHENTICATE_PATH,
     EASYIQ_CALENDAR_PATH,
+    EASYIQ_CHILDREN_PATH,
     EASYIQ_HOMEWORK_PATH,
     EASYIQ_PORTAL,
     MEEBOOK_API,
@@ -113,6 +115,16 @@ class AulaWidgetsClient:
         self._api_client = api_client
         # child user ID -> the (loginId, child header) pair EasyIQ accepted.
         self._easyiq_identifiers: dict[str, list[tuple[str, str]]] = {}
+        # Whether the WS-Federation portal session (AuthenticateAulaUser) has
+        # been established for this client instance. Best-effort: stays
+        # False on failure so a later call retries it.
+        self._easyiq_session_ready: bool = False
+        # normalized child name -> EasyIQ's own Id, from GetChildren.
+        self._easyiq_children_by_name: dict[str, str] = {}
+        # normalized names GetChildren listed more than once, so callers
+        # know an omission from the map above means "ambiguous", not
+        # "unknown".
+        self._easyiq_children_ambiguous: set[str] = set()
 
     async def _get_bearer_token(self, widget_id: str) -> str:
         resp = await self._api_client._request_with_version_retry(
@@ -122,6 +134,92 @@ class AulaWidgetsClient:
         resp.raise_for_status()
         token = "Bearer " + str(resp.json()["data"])
         return token
+
+    @staticmethod
+    def _normalize_easyiq_name(name: str) -> str:
+        return " ".join(name.split()).casefold()
+
+    def resolve_easyiq_child_id(self, child_name: str) -> str | None:
+        """Return the EasyIQ Id ``child_name`` resolved to via ``GetChildren``.
+
+        ``None`` if the session was never established, the name was not
+        listed, or it was listed more than once (see
+        :meth:`ensure_easyiq_session`).
+        """
+        return self._easyiq_children_by_name.get(self._normalize_easyiq_name(child_name))
+
+    async def ensure_easyiq_session(
+        self,
+        institution_filter: list[str],
+        guardian_login: str,
+        child_user_ids: list[str],
+    ) -> None:
+        """Establish the EasyIQ portal's WS-Federation session, once.
+
+        The portal's controllers (``GetChildren``, the weekplan/homework
+        endpoints) require ``FedAuth``/``FedAuth1``/``ASP.NET_SessionId``
+        cookies that only ``POST /Aula/AuthenticateAulaUser`` sets; the Aula
+        bearer token alone is not enough. Verified against the live portal:
+        ``x-child`` must be one child's UniLogin and ``x-childfilter`` all of
+        the guardian's children's UniLogins, comma-separated — a guardian
+        login in either header 500s. ``child_user_ids`` is that list, with
+        UniLogins as ``userId`` (see the callers in ``cli.py`` and
+        ``easyiq_probe.py`` for where it comes from). This is best-effort: on
+        failure it logs and returns without raising, so identifier guessing
+        in :meth:`easyiq_identifier_variants` remains a working fallback.
+        """
+        if self._easyiq_session_ready:
+            return
+        if not child_user_ids:
+            _LOGGER.info("EasyIQ session bootstrap skipped: no children to authenticate as")
+            return
+
+        try:
+            token = await self._get_bearer_token(WIDGET_EASYIQ_HOMEWORK)
+            headers = {
+                **self.easyiq_headers(token, institution_filter, guardian_login, child_user_ids),
+                "Origin": EASYIQ_PORTAL,
+                "Referer": f"{EASYIQ_PORTAL}/LektierWidget",
+            }
+            resp = await self._api_client._request_with_version_retry(
+                "post", f"{EASYIQ_PORTAL}{EASYIQ_AUTHENTICATE_PATH}", headers=headers
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            _LOGGER.info("EasyIQ AuthenticateAulaUser failed (%s); portal calls may 500", e)
+            return
+
+        self._easyiq_session_ready = True
+
+        try:
+            resp = await self._api_client._request_with_version_retry(
+                "get",
+                f"{EASYIQ_PORTAL}{EASYIQ_CHILDREN_PATH}",
+                headers=self.easyiq_headers(
+                    token, institution_filter, guardian_login, child_user_ids
+                ),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("Children", []) if isinstance(data, dict) else []
+        except Exception as e:
+            _LOGGER.info("EasyIQ GetChildren failed (%s); name-based lookup unavailable", e)
+            return
+
+        grouped: dict[str, list[str]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("Name") or entry.get("name") or "")
+            child_id = str(entry.get("Id") or entry.get("id") or "")
+            if not name or not child_id:
+                continue
+            grouped.setdefault(self._normalize_easyiq_name(name), []).append(child_id)
+
+        self._easyiq_children_by_name = {
+            name: ids[0] for name, ids in grouped.items() if len(ids) == 1
+        }
+        self._easyiq_children_ambiguous = {name for name, ids in grouped.items() if len(ids) > 1}
 
     async def get_mu_tasks(
         self,
@@ -181,15 +279,30 @@ class AulaWidgetsClient:
         return [MUWeeklyPerson.from_dict(p) for p in resp.json().get("personer", [])]
 
     def easyiq_headers(
-        self, token: str, institution_filter: list[str], guardian_login: str
+        self,
+        token: str,
+        institution_filter: list[str],
+        guardian_login: str,
+        child_user_ids: list[str],
     ) -> dict[str, str]:
-        """Headers the EasyIQ portal expects from its embedded widgets."""
+        """Headers the EasyIQ portal expects from its embedded widgets.
+
+        ``x-child``/``x-childfilter`` are required on every portal call, not
+        just ``AuthenticateAulaUser`` (verified against the live portal:
+        without them ``GetChildren`` 500s even with valid session cookies).
+        Default to the first child and the full comma-separated list.
+        Per-child callers (Calendar, AulaHuskeliste) override ``x-child``
+        afterward with that child's own identifier guess; ``x-childfilter``
+        must stay the full list, so callers must not override it too.
+        """
         return {
             "Authorization": token,
             "Accept": "application/json",
             "x-institutionfilter": ",".join(institution_filter),
             "x-userprofile": "guardian",
             "x-login": guardian_login,
+            "x-child": child_user_ids[0] if child_user_ids else guardian_login,
+            "x-childfilter": ",".join(child_user_ids),
             "x-requested-with": "XMLHttpRequest",
             # EasyIQ only serves these controllers to callers that look like
             # the embedded widget.
@@ -197,14 +310,23 @@ class AulaWidgetsClient:
         }
 
     def easyiq_identifier_variants(
-        self, child_profile_id: str, child_user_id: str, guardian_login: str
+        self,
+        child_profile_id: str,
+        child_user_id: str,
+        guardian_login: str,
+        resolved_easyiq_id: str | None = None,
     ) -> list[tuple[str, str]]:
         """Return the ``(loginId, child header)`` pairs to try, best guess first.
 
         A pair already known to work for this child is moved to the front.
+        ``resolved_easyiq_id`` — EasyIQ's own Id for this child, from
+        ``GetChildren`` via :meth:`resolve_easyiq_child_id` — is tried next,
+        ahead of the blind guesses, when known.
         """
+        resolved = [(resolved_easyiq_id, resolved_easyiq_id)] if resolved_easyiq_id else []
         return _ordered_unique(
             self._easyiq_identifiers.get(child_user_id, [])
+            + resolved
             + [
                 (child_profile_id, child_user_id),
                 (child_user_id, child_user_id),
@@ -222,6 +344,8 @@ class AulaWidgetsClient:
         institution_filter: list[str],
         child_profile_id: str,
         child_user_id: str,
+        child_name: str,
+        all_child_user_ids: list[str],
         guardian_login: str,
         widget_id: str,
     ) -> list[EasyIQCalendarEvent]:
@@ -234,18 +358,30 @@ class AulaWidgetsClient:
         returns rows, remembering it so later weeks cost a single request. A
         remembered combination that stops working costs one wasted request
         before the rest are tried again.
+
+        A session established via :meth:`ensure_easyiq_session` lets the
+        first guess be EasyIQ's own Id for ``child_name``, resolved from
+        ``GetChildren``, instead of starting blind.
         """
+        await self.ensure_easyiq_session(institution_filter, guardian_login, all_child_user_ids)
         token = await self._get_bearer_token(widget_id)
-        base_headers = self.easyiq_headers(token, institution_filter, guardian_login)
+        base_headers = self.easyiq_headers(
+            token, institution_filter, guardian_login, all_child_user_ids
+        )
         params = {"date": monday_of_week(week), **extra_params}
 
         first_empty: list[EasyIQCalendarEvent] | None = None
         last_error: Exception | None = None
 
         for login_id, child_header in self.easyiq_identifier_variants(
-            child_profile_id, child_user_id, guardian_login
+            child_profile_id,
+            child_user_id,
+            guardian_login,
+            resolved_easyiq_id=self.resolve_easyiq_child_id(child_name),
         ):
-            headers = {**base_headers, "x-child": child_header, "x-childfilter": child_header}
+            # x-childfilter stays the full list from base_headers; only
+            # x-child is this attempt's per-child guess.
+            headers = {**base_headers, "x-child": child_header}
             try:
                 resp = await self._api_client._request_with_version_retry(
                     "get",
@@ -279,6 +415,8 @@ class AulaWidgetsClient:
         institution_filter: list[str],
         child_profile_id: str,
         child_user_id: str,
+        child_name: str,
+        all_child_user_ids: list[str],
         guardian_login: str,
         widget_id: str = WIDGET_EASYIQ_WEEKPLAN,
     ) -> list[EasyIQCalendarEvent]:
@@ -299,6 +437,8 @@ class AulaWidgetsClient:
             institution_filter=institution_filter,
             child_profile_id=child_profile_id,
             child_user_id=child_user_id,
+            child_name=child_name,
+            all_child_user_ids=all_child_user_ids,
             guardian_login=guardian_login,
             widget_id=widget_id,
         )
@@ -310,6 +450,8 @@ class AulaWidgetsClient:
         institution_filter: list[str],
         child_profile_id: str,
         child_user_id: str,
+        child_name: str,
+        all_child_user_ids: list[str],
         guardian_login: str,
         widget_id: str = WIDGET_EASYIQ_HOMEWORK,
     ) -> list[EasyIQCalendarEvent]:
@@ -326,6 +468,8 @@ class AulaWidgetsClient:
             institution_filter=institution_filter,
             child_profile_id=child_profile_id,
             child_user_id=child_user_id,
+            child_name=child_name,
+            all_child_user_ids=all_child_user_ids,
             guardian_login=guardian_login,
             widget_id=widget_id,
         )
@@ -339,6 +483,8 @@ class AulaWidgetsClient:
         widget_id: str = WIDGET_EASYIQ_WEEKPLAN,
         *,
         child_profile_id: str | None = None,
+        child_name: str = "",
+        all_child_user_ids: list[str] | None = None,
     ) -> list[Appointment]:
         """Fetch a child's EasyIQ weekly plan.
 
@@ -385,6 +531,8 @@ class AulaWidgetsClient:
             institution_filter=institution_filter,
             child_profile_id=child_profile_id,
             child_user_id=child_id,
+            child_name=child_name,
+            all_child_user_ids=all_child_user_ids or [],
             guardian_login=session_uuid,
             widget_id=widget_id,
         )
@@ -410,6 +558,8 @@ class AulaWidgetsClient:
         child_id: str,
         *,
         child_profile_id: str,
+        child_name: str,
+        all_child_user_ids: list[str],
     ) -> list[EasyIQHomework]:
         """Fetch a child's EasyIQ homework for a week.
 
@@ -421,6 +571,8 @@ class AulaWidgetsClient:
             institution_filter=institution_filter,
             child_profile_id=child_profile_id,
             child_user_id=child_id,
+            child_name=child_name,
+            all_child_user_ids=all_child_user_ids,
             guardian_login=session_uuid,
         )
         homework = [event for event in events if event.item_type in HOMEWORK_ITEM_TYPES]

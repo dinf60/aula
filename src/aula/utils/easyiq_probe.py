@@ -56,6 +56,8 @@ class ChildProbe:
     label: str
     easyiq_entry_found: bool = False
     easyiq_id_matches: list[str] = field(default_factory=list)
+    easyiq_name_resolved: bool = False
+    easyiq_name_ambiguous: bool = False
     attempts: dict[str, list[Attempt]] = field(default_factory=dict)
 
 
@@ -131,6 +133,7 @@ async def probe_easyiq(
     guardian_login: str,
     date: str,
     institution_filter: list[str] | None = None,
+    all_child_user_ids: list[str] | None = None,
     include_values: bool = False,
 ) -> ProbeReport:
     """Run the probe and return its report.
@@ -138,9 +141,12 @@ async def probe_easyiq(
     ``date`` is an ISO timestamp inside the week to ask about.
     ``institution_filter`` must be the same list the real commands send:
     EasyIQ answers differently without it, so a probe that omitted it would
-    report failures the working code never sees.
+    report failures the working code never sees. ``all_child_user_ids`` are
+    the guardian's children's UniLogins (from ``profiles.getProfileContext``'s
+    ``relations``) that the session bootstrap needs for ``x-childfilter``.
     """
     institution_filter = institution_filter or []
+    all_child_user_ids = all_child_user_ids or []
     report = ProbeReport()
 
     try:
@@ -166,8 +172,17 @@ async def probe_easyiq(
     if not tokens:
         return report
 
+    # Establishes the WS-Federation portal session (AuthenticateAulaUser) so
+    # the GetChildren call below - and the name-based resolution it feeds -
+    # actually succeeds instead of the 500 it gets without it.
+    await client.widgets.ensure_easyiq_session(
+        institution_filter, guardian_login, all_child_user_ids
+    )
+
     any_token = next(iter(tokens.values()))
-    headers = client.widgets.easyiq_headers(any_token, institution_filter, guardian_login)
+    headers = client.widgets.easyiq_headers(
+        any_token, institution_filter, guardian_login, all_child_user_ids
+    )
     entries: list[dict[str, Any]] = []
     try:
         resp = await client._request_with_version_retry(
@@ -190,14 +205,29 @@ async def probe_easyiq(
         probe = ChildProbe(label=f"Child {index} of {len(children)}")
         probe.easyiq_entry_found, probe.easyiq_id_matches = _match_easyiq_entry(entries, aula_ids)
 
+        resolved_id = client.widgets.resolve_easyiq_child_id(child.name)
+        probe.easyiq_name_resolved = resolved_id is not None
+        probe.easyiq_name_ambiguous = (
+            client.widgets._normalize_easyiq_name(child.name)
+            in client.widgets._easyiq_children_ambiguous
+        )
+        if resolved_id:
+            # Added after _match_easyiq_entry so it can't trivially "match itself".
+            aula_ids["easyiq_name_match"] = resolved_id
+
         for path, widget_id, extra_params in PROBE_TARGETS:
             token = tokens.get(widget_id)
             if token is None:
                 continue
-            base = client.widgets.easyiq_headers(token, institution_filter, guardian_login)
+            base = client.widgets.easyiq_headers(
+                token, institution_filter, guardian_login, all_child_user_ids
+            )
             attempts: list[Attempt] = []
             for login_id, child_header in client.widgets.easyiq_identifier_variants(
-                aula_ids["institution_profile_id"], aula_ids["user_id"], guardian_login
+                aula_ids["institution_profile_id"],
+                aula_ids["user_id"],
+                guardian_login,
+                resolved_easyiq_id=resolved_id,
             ):
                 attempt = Attempt(
                     login_id_source=_name_of(login_id, aula_ids, guardian_login),
@@ -208,7 +238,9 @@ async def probe_easyiq(
                         "get",
                         f"{EASYIQ_PORTAL}{path}",
                         params={**extra_params, "date": date, "loginId": login_id},
-                        headers={**base, "x-child": child_header, "x-childfilter": child_header},
+                        # x-childfilter stays the full list from `base`; only
+                        # x-child is this attempt's per-child guess.
+                        headers={**base, "x-child": child_header},
                     )
                     attempt.status = resp.status_code
                     payload = resp.json()
@@ -264,6 +296,11 @@ def render_report(report: ProbeReport, include_values: bool = False) -> list[str
             lines.append(f"  EasyIQ Id equals the Aula {' and '.join(probe.easyiq_id_matches)}")
         else:
             lines.append("  listed by EasyIQ, but its Id matches no Aula identifier")
+
+        if probe.easyiq_name_resolved:
+            lines.append("  resolved via Name match against GetChildren")
+        elif probe.easyiq_name_ambiguous:
+            lines.append("  Name matches more than one GetChildren entry; falling back to guessing")
 
         for path, attempts in probe.attempts.items():
             lines.append(f"  {path}")
